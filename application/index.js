@@ -1,4 +1,5 @@
-import { createServer } from "node:http";
+﻿import { createServer } from "node:http";
+import amqp from "amqplib";
 import { MongoClient } from "mongodb";
 import mysql from "mysql2/promise";
 import { createClient } from "redis";
@@ -31,6 +32,7 @@ const mongo = new MongoClient(
     authSource: "admin",
   },
 );
+
 const redis = createClient({
   socket: {
     host: required("REDIS_HOST"),
@@ -73,23 +75,36 @@ const sendJson = (response, statusCode, payload, trace = []) => {
   response.end(JSON.stringify(payload));
 };
 
+const REVIEWS_QUEUE = "reviews.queue";
+const REVIEWS_DLQ = "reviews.dlq";
+
 const start = async () => {
   await Promise.all([mongo.connect(), redis.connect()]);
+  const amqpConn = await amqp.connect(required("RABBITMQ_URL"));
+  const amqpChannel = await amqpConn.createChannel();
+  await amqpChannel.assertQueue(REVIEWS_DLQ, { durable: true });
+  await amqpChannel.assertQueue(REVIEWS_QUEUE, {
+    durable: true,
+    deadLetterExchange: "",
+    deadLetterRoutingKey: REVIEWS_DLQ,
+  });
+
   const reviews = mongo.db(required("MONGO_DB")).collection("product_reviews");
   const productsCacheKey = "store:products:cheapest";
+
   const server = createServer((request, response) => {
     const trace = [
       request.headers["x-presentation-lb"] || "presentation-lb-unknown",
       request.headers["x-web-node"] || "web-node-unknown",
       request.headers["x-application-lb"] || "application-lb-unknown",
-      process.env.APPLICATION_NODE || "app-node-unknown",
+      process.env.APPLICATION_NODE || process.env.HOSTNAME || "app-node-unknown",
     ];
     void (async () => {
       const pathname = new URL(request.url, "http://localhost").pathname;
 
       if (request.method === "GET" && pathname === "/health") {
         await Promise.all([pool.query("SELECT 1"), mongo.db().command({ ping: 1 }), redis.ping()]);
-        sendJson(response, 200, { status: "ok" }, [...trace, "galera1", "mongodb", "redis"]);
+        sendJson(response, 200, { status: "ok" }, [...trace, "mariadb", "mongodb", "redis", "rabbitmq"]);
         return;
       }
 
@@ -111,7 +126,7 @@ const start = async () => {
           return;
         }
         trace[trace.length - 1] = "redis (cache miss)";
-        trace.push("galera1");
+        trace.push("mariadb");
         const [products] = await pool.execute(
           "SELECT id, sku, name, description, price FROM products ORDER BY price ASC, id ASC LIMIT 10",
         );
@@ -166,7 +181,7 @@ const start = async () => {
         ) {
           throw new HttpError(400, "Provide reviewer, rating (1-5), and comment within the allowed lengths");
         }
-        trace.push("galera1 (product lookup)");
+        trace.push("mariadb (product lookup)");
         const [matches] = await pool.execute("SELECT 1 FROM products WHERE sku = ? LIMIT 1", [
           reviewMatch[1],
         ]);
@@ -178,10 +193,13 @@ const start = async () => {
           reviewer,
           rating: body.rating,
           comment,
-          createdAt: new Date(),
+          createdAt: new Date().toISOString(),
         };
-        const result = await reviews.insertOne(review);
-        sendJson(response, 201, { id: result.insertedId.toString(), ...review }, [...trace, "mongodb (insert review)"]);
+        amqpChannel.sendToQueue(REVIEWS_QUEUE, Buffer.from(JSON.stringify(review)), {
+          persistent: true,
+          contentType: "application/json",
+        });
+        sendJson(response, 202, { status: "queued", ...review }, [...trace, "rabbitmq (queued review)"]);
         return;
       }
 
@@ -209,7 +227,9 @@ const start = async () => {
 
   const shutdown = () => {
     server.close(() => {
-      void Promise.all([pool.end(), mongo.close(), redis.quit()]).then(() => process.exit(0));
+      void Promise.all([pool.end(), amqpChannel.close(), amqpConn.close(), mongo.close(), redis.quit()]).then(() =>
+        process.exit(0)
+      );
     });
   };
   process.on("SIGINT", shutdown);
