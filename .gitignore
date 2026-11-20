@@ -24,3 +24,7 @@ credentials.json
 backups/
 **/backups/
 
+
+*.tfvars
+*.tfstate*
+.terraform/
